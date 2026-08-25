@@ -155,6 +155,39 @@ router.post(
  *   Channels → SMS → Configuration → Default SMS webhook URL
  */
 router.post('/webhooks/infobip', (req, res) => {
+  // ── SÉCURITÉ : valider la signature HMAC si le secret est configuré ──
+  // Sans cette vérification, n'importe qui peut forger des SMS entrants et
+  // déclencher des auto-réponses payées par nos crédits Infobip.
+  const crypto     = require('crypto');
+  const secret     = process.env.INFOBIP_WEBHOOK_SECRET;
+  const enforced   = process.env.INFOBIP_REQUIRE_SIGNATURE === 'true';
+  const sig        = req.headers['authorization'] || req.headers['x-hub-signature'] || '';
+  const hasSecret  = !!secret;
+
+  if (!hasSecret && enforced) {
+    logger.error('[Infobip/Webhook] INFOBIP_REQUIRE_SIGNATURE=true mais INFOBIP_WEBHOOK_SECRET absent.');
+    return res.status(503).json({ error: 'Webhook non sécurisé.', code: 'WEBHOOK_NOT_CONFIGURED' });
+  }
+
+  if (hasSecret && sig) {
+    try {
+      const raw    = req.rawBody || JSON.stringify(req.body || {});
+      const hmac   = crypto.createHmac('sha256', secret).update(raw).digest('hex');
+      const sigVal = sig.replace(/^sha256=/, '').toLowerCase();
+      const bufA   = Buffer.from(hmac, 'hex');
+      const bufB   = Buffer.from(sigVal, 'hex');
+      const ok     = bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
+      if (!ok) {
+        logger.warn('[Infobip/Webhook] Signature invalide — requête REJETÉE', { ip: req.ip });
+        return res.status(403).json({ error: 'Signature invalide.', code: 'INVALID_SIGNATURE' });
+      }
+    } catch (_) {
+      return res.status(403).json({ error: 'Signature invalide.', code: 'INVALID_SIGNATURE' });
+    }
+  } else if (hasSecret && !sig) {
+    logger.warn('[Infobip/Webhook] Signature manquante alors que INFOBIP_WEBHOOK_SECRET est configuré (mode permissif).');
+  }
+
   // Always respond 200 immediately so Infobip does not retry
   res.status(200).json({ received: true });
 

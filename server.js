@@ -30,6 +30,8 @@ const {
   globalSlowDown,
   authLimiter,
   leekPayLimiter,
+  messageSendLimiter,
+  uploadLimiter,
   inputSanitizer,
   requireJson,
 } = require('./middleware/security');
@@ -134,18 +136,11 @@ app.get('/health', (_req, res) => {
   let queueStatus = {};
   try { queueStatus = require('./services/queueService').getQueueStatus(); } catch (_) {}
 
-  // Expose full Infobip config details for diagnostics
+  // Expose Infobip config status (sans URL brute — info publique non nécessaire)
   let infobipDetails = {};
   try {
     const ibStatus = require('./services/infobip').getStatus();
-    const rawUrl   = process.env.INFOBIP_BASE_URL || '';
-    const hasHttps = rawUrl.match(/^https?:\/\//i);
-    infobipDetails = {
-      ...ibStatus,
-      rawBaseUrl     : rawUrl,
-      hasHttpsPrefix : !!hasHttps,
-      normalizedUrl  : hasHttps ? rawUrl : (rawUrl ? 'https://' + rawUrl : null),
-    };
+    infobipDetails = { configured: !!ibStatus.configured, senderId: ibStatus.senderId || null };
   } catch (_) {}
 
   res.status(200).json({
@@ -245,12 +240,16 @@ app.use('/auth',     authLimiter, requireJson, authRoutes);  // retrocompat
 app.use('/api/contacts', contactsV2Routes);
 
 /* ── Messages v2 ─────────────────────────────────────────── */
+// Rate limit dédié sur l'envoi (protège le crédit SMS Infobip)
+app.post('/api/messages/send', messageSendLimiter);
 app.use('/api/messages', messagesV2Routes);
 
 /* ── Audio v2 ────────────────────────────────────────────── */
+app.post('/api/audio/upload', uploadLimiter);       // rate limit dédié uploads
 app.use('/api/audio', audioV2Routes);
 
 /* ── Transcription v2 (Faster-Whisper) ──────────────────── */
+app.post('/api/transcription', uploadLimiter);      // rate limit dédié uploads
 app.use('/api/transcription', transcriptionRoutes);
 
 /* ── Infobip webhooks entrants ───────────────────────────── */
@@ -265,7 +264,8 @@ app.use('/', infobipRoutes);
 
 /* ── Premium user status (via LeekPay controller) ────────── */
 const { getUserPremiumStatus } = require('./controllers/leekpayController');
-app.get('/api/user/status', (req, res) => getUserPremiumStatus(req, res));
+const firebaseAuthGuard = require('./middleware/firebaseAuth');
+app.get('/api/user/status', firebaseAuthGuard, (req, res) => getUserPremiumStatus(req, res));
 
 /* ── Admin & feature routes ──────────────────────────────── */
 app.use('/admin',         adminRoutes);
@@ -310,7 +310,25 @@ app.get('/api/status', (_req, res) => {
 });
 
 /* ── Diagnostic endpoint (env var audit, no secret values) ── */
-app.get('/api/diag', (_req, res) => {
+// SÉCURITÉ : protégé par ADMIN_KEY (comparaison timing-safe) — cet endpoint
+// révèle la configuration (présence/longueur des secrets, état Redis/queue).
+function isAdminRequest(req) {
+  const expected = process.env.ADMIN_KEY || '';
+  if (!expected) return process.env.NODE_ENV !== 'production';
+  const provided = String(req.headers['x-admin-key'] || '');
+  const crypto   = require('crypto');
+  try {
+    const a = Buffer.from(expected);
+    const b = Buffer.from(provided.padEnd(a.length, '\0').slice(0, a.length));
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch (_) { return false; }
+}
+
+app.get('/api/diag', (req, res) => {
+  if (!isAdminRequest(req)) {
+    return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
+  }
+
   // List of all env vars the app uses — report presence/absence without values
   const EXPECTED_VARS = [
     'NODE_ENV', 'PORT', 'JWT_SECRET', 'BACKEND_URL', 'FRONTEND_URL', 'CORS_ORIGIN',
@@ -327,10 +345,11 @@ app.get('/api/diag', (_req, res) => {
     const v = process.env[k];
     if (!v) {
       envStatus[k] = 'MISSING';
-    } else if (k.includes('KEY') || k.includes('SECRET') || k.includes('JSON') || k.includes('URL')) {
-      envStatus[k] = `SET (${v.length} chars, starts: ${v.slice(0,4)}...)`;
+    } else if (k.includes('KEY') || k.includes('SECRET') || k.includes('JSON')) {
+      // SÉCURITÉ : ne JAMAIS exposer de préfixe de secret (même partiel)
+      envStatus[k] = `SET (${v.length} chars)`;
     } else {
-      envStatus[k] = v;
+      envStatus[k] = k.includes('URL') ? `SET (${v.length} chars)` : v;
     }
   });
 
@@ -369,8 +388,7 @@ app.get('/api/diag', (_req, res) => {
 
 /* ── Direct Infobip SMS test (admin key required) ─────────── */
 app.post('/api/diag/sms-test', async (req, res) => {
-  const adminKey = req.headers['x-admin-key'] || req.body?.adminKey;
-  if (!process.env.ADMIN_KEY || adminKey !== process.env.ADMIN_KEY) {
+  if (!isAdminRequest(req)) {
     return res.status(403).json({ error: 'Forbidden', code: 'FORBIDDEN' });
   }
 
@@ -384,8 +402,8 @@ app.post('/api/diag/sms-test', async (req, res) => {
 
   const rawUrl = process.env.INFOBIP_BASE_URL || '';
   const diagInfo = {
+    INFOBIP_API_KEY_set  : !!process.env.INFOBIP_API_KEY,
     INFOBIP_API_KEY_len  : (process.env.INFOBIP_API_KEY || '').length,
-    INFOBIP_API_KEY_prefix: (process.env.INFOBIP_API_KEY || '').slice(0, 8),
     INFOBIP_BASE_URL_raw : rawUrl,
     INFOBIP_BASE_URL_normalized: rawUrl.match(/^https?:\/\//i) ? rawUrl : ('https://' + rawUrl),
     INFOBIP_SENDER_ID    : process.env.INFOBIP_SENDER_ID || 'OmniSMS',
@@ -477,11 +495,9 @@ server.listen(PORT, '0.0.0.0', () => {
   const groqOk     = !!process.env.GROQ_API_KEY;
 
   // Detailed Infobip diagnostic at startup
-  const rawInfobipUrl    = process.env.INFOBIP_BASE_URL || '';
-  const infobipKeyLen    = (process.env.INFOBIP_API_KEY || '').length;
-  const infobipKeyPrefix = (process.env.INFOBIP_API_KEY || '').slice(0, 8);
-  const infobipHasHttps  = rawInfobipUrl.match(/^https?:\/\//i);
-  const infobipNormUrl   = infobipHasHttps ? rawInfobipUrl : (rawInfobipUrl ? `https://${rawInfobipUrl}` : 'NOT SET');
+  const rawInfobipUrl = process.env.INFOBIP_BASE_URL || '';
+  const infobipHasHttps = rawInfobipUrl.match(/^https?:\/\//i);
+  const infobipNormUrl  = infobipHasHttps ? rawInfobipUrl : (rawInfobipUrl ? `https://${rawInfobipUrl}` : 'NOT SET');
 
   logger.info('OmniSMS Backend v4.0 started', {
     port    : PORT,
@@ -489,7 +505,7 @@ server.listen(PORT, '0.0.0.0', () => {
     node    : process.version,
     firebase: firebaseOk ? 'OK' : 'MISSING',
     jwt     : jwtOk      ? 'OK' : 'MISSING',
-    infobip : infobipOk  ? `OK (key:${infobipKeyPrefix}..., url:${infobipNormUrl})` : 'MISSING',
+    infobip : infobipOk  ? `OK (url:${infobipNormUrl})` : 'MISSING',
     redis   : redisOk    ? 'CONFIGURED' : 'MISSING (memory fallback)',
     groq    : groqOk     ? 'OK' : 'MISSING',
   });
@@ -503,9 +519,9 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('🔑 JWT        : ' + (jwtOk ? '✅ configured' : '❌ MISSING — set JWT_SECRET'));
   console.log('💳 LeekPay    : ' + (lpOk  ? '✅ ACTIVE' : '⚠️  INACTIVE — set LEEKPAY_API_KEY + LEEKPAY_SECRET_KEY'));
   console.log('📡 Infobip    : ' + (infobipOk
-    ? `✅ ACTIVE — key:${infobipKeyPrefix}... url:${infobipNormUrl} hasHttps:${!!infobipHasHttps}`
+    ? `✅ ACTIVE — url:${infobipNormUrl} hasHttps:${!!infobipHasHttps}`
     : '❌ INACTIVE — set INFOBIP_API_KEY and INFOBIP_BASE_URL'));
-  console.log('🗄️  Redis      : ' + (redisOk ? `✅ CONFIGURED — ${rawInfobipUrl ? process.env.REDIS_URL?.slice(0,30) + '...' : ''}` : '⚠️  MISSING — using memory fallback (set REDIS_URL on Render)'));
+  console.log('🗄️  Redis      : ' + (redisOk ? '✅ CONFIGURED' : '⚠️  MISSING — using memory fallback (set REDIS_URL on Render)'));
   console.log('🤖 Groq       : ' + (groqOk  ? '✅ ACTIVE — Whisper transcription ready' : '❌ MISSING — set GROQ_API_KEY'));
   console.log('🔌 Socket.IO  : ' + (io ? '✅ ACTIVE' : '❌ INACTIVE'));
   console.log('📊 Diag       : GET /api/diag  (env var audit)');

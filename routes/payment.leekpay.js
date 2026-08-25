@@ -40,6 +40,7 @@ const express    = require('express');
 const router     = express.Router();
 const controller = require('../controllers/leekpayController');
 const { logger } = require('../middleware/logger');
+const firebaseAuth = require('../middleware/firebaseAuth');
 
 // ══════════════════════════════════════════════════════════════
 //  MIDDLEWARE WEBHOOK : parser le rawBody avant json()
@@ -87,7 +88,7 @@ function webhookLogger(req, res, next) {
  *     "expiresAt"   : "2026-01-16T12:00:00Z"
  *   }
  */
-router.post('/leekpay', controller.createPayment);
+router.post('/leekpay', firebaseAuth, controller.createPayment);
 
 // ══════════════════════════════════════════════════════════════
 //  ROUTE 2 : POST /api/payment/webhook/leekpay
@@ -149,7 +150,7 @@ router.post('/webhook/leekpay', webhookLogger, controller.handleWebhook);
  *     "source"          : "firestore"
  *   }
  */
-router.get('/status/:transactionId', controller.getPaymentStatus);
+router.get('/status/:transactionId', firebaseAuth, controller.getPaymentStatus);
 
 // ══════════════════════════════════════════════════════════════
 //  ROUTE 4 : GET /api/payment/user-status
@@ -171,13 +172,13 @@ router.get('/status/:transactionId', controller.getPaymentStatus);
  *     "paymentMethod": "leekpay"
  *   }
  */
-router.get('/user-status', controller.getUserPremiumStatus);
+router.get('/user-status', firebaseAuth, controller.getUserPremiumStatus);
 
 // ══════════════════════════════════════════════════════════════
 //  ROUTE 5 : POST /api/payment/poll/:checkoutId
 //  Polling manuel — vérifier le statut et activer si "paid"
 //  Utilisé par le frontend si aucun webhook n'est reçu
 // ══════════════════════════════════════════════════════════════
-router.post('/poll/:checkoutId', controller.pollPayment);
+router.post('/poll/:checkoutId', firebaseAuth, controller.pollPayment);
 
 module.exports = router;

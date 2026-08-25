@@ -301,13 +301,21 @@ function verifyWebhookSignature(rawBody, signature) {
   ).trim();
 
   if (!signingKey) {
-    logger.warn('[LeekPay] Clé signature webhook absente — mode dégradé (accepté sans vérification).');
+    if (process.env.NODE_ENV === 'production') {
+      logger.error('[LeekPay] Clé signature webhook absente en PRODUCTION — webhook REJETÉ (configurer LEEKPAY_WEBHOOK_SECRET).');
+      return false;
+    }
+    logger.warn('[LeekPay] Clé signature webhook absente — mode dégradé dev uniquement (accepté sans vérification).');
     return true;
   }
 
   if (!signature) {
-    logger.warn('[LeekPay] Header X-LeekPay-Signature absent — webhook accepté en mode dégradé.');
-    return true;  // Accepter si aucune signature (pas encore configurée côté LeekPay)
+    if (process.env.NODE_ENV === 'production') {
+      logger.error('[LeekPay] Header X-LeekPay-Signature absent — webhook REJETÉ (anti-spoofing).');
+      return false;
+    }
+    logger.warn('[LeekPay] Header X-LeekPay-Signature absent — webhook accepté en mode dégradé (dev uniquement).');
+    return true;  // Accepter si aucune signature, uniquement hors production
   }
 
   try {
@@ -339,7 +347,7 @@ function verifyWebhookSignature(rawBody, signature) {
 
   } catch (err) {
     logger.error('[LeekPay] Erreur vérification signature', { error: err.message });
-    return true;  // mode dégradé — accepter plutôt que bloquer
+    return false;  // fail-closed : ne jamais accepter un webhook non vérifiable
   }
 }
 

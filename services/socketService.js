@@ -268,9 +268,27 @@ function initSocketIO(httpServer) {
     /**
      * Message lu / vu
      * Client → { messageId, senderId }
+     * SÉCURITÉ : vérifier que le socket courant est bien le destinataire du
+     * message avant d'émettre l'accusé et de mettre à jour Firestore
+     * (sinon IDOR : n'importe qui peut marquer "vu" un message arbitraire).
      */
     socket.on('message:read', async ({ messageId, senderId }) => {
       if (!messageId || !senderId) return;
+
+      try {
+        const db = require('../config/firebase');
+        if (db && !db._stub) {
+          const snap = await db.collection('messages').doc(messageId).get();
+          if (!snap.exists) return;
+          const msg = snap.data();
+          if (msg.receiverId !== uid) {
+            logger.warn('[Socket] message:read refusé — socket ≠ receiverId', { messageId, uid });
+            return;
+          }
+          // senderId dérivé du message réel (jamais du client)
+          senderId = msg.senderId;
+        }
+      } catch (_) {}
 
       // Notifier l'expéditeur
       _io.to(`user:${senderId}`).emit('message:seen', {
@@ -286,14 +304,30 @@ function initSocketIO(httpServer) {
     /**
      * Accusé de réception (livraison)
      * Client → { messageId, senderId }
+     * SÉCURITÉ : même contrôle de propriété que message:read.
      */
-    socket.on('message:delivered', ({ messageId, senderId }) => {
-      if (!messageId || !senderId) return;
-      _io.to(`user:${senderId}`).emit('message:delivered', {
-        messageId,
-        deliveredTo : uid,
-        deliveredAt : new Date().toISOString(),
-      });
+    socket.on('message:delivered', ({ messageId }) => {
+      if (!messageId) return;
+
+      (async () => {
+        try {
+          const db = require('../config/firebase');
+          if (db && !db._stub) {
+            const snap = await db.collection('messages').doc(messageId).get();
+            if (!snap.exists) return;
+            const msg = snap.data();
+            if (msg.receiverId !== uid) {
+              logger.warn('[Socket] message:delivered refusé — socket ≠ receiverId', { messageId, uid });
+              return;
+            }
+            _io.to(`user:${msg.senderId}`).emit('message:delivered', {
+              messageId,
+              deliveredTo : uid,
+              deliveredAt : new Date().toISOString(),
+            });
+          }
+        } catch (_) {}
+      })();
     });
 
     /* ── Typing status ───────────────────────────────────── */

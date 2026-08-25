@@ -181,8 +181,11 @@ async function createPayment(req, res) {
   }
 
   const cleanUserId = userId.trim();
-  const payAmount   = Number(amount)   || leekpay.PREMIUM_AMOUNT;
-  const payCurrency = (currency || leekpay.PREMIUM_CURRENCY).toUpperCase();
+  // ── SÉCURITÉ : le montant est TOUJOURS fixé côté serveur ──────────────
+  // Ignorer tout `amount`/`currency` envoyé par le client (sinon un attaquant
+  // pourrait créer un checkout de 100 XOF et obtenir le premium 2000 XOF).
+  const payAmount   = leekpay.PREMIUM_AMOUNT;
+  const payCurrency = leekpay.PREMIUM_CURRENCY;
 
   try { leekpay.validateAmount(payAmount, payCurrency); }
   catch (err) {
@@ -385,6 +388,24 @@ async function processWebhookPayload(body, rawBody, signature, event) {
 async function handleSuccessfulPayment({ checkoutId, transactionId, userId, orderId, amount, currency, paymentMethod, paidAt, customer }) {
   logger.info('[LeekPay] Paiement confirmé (paid) ✅', { checkoutId, transactionId, userId, amount, currency });
 
+  // ── SÉCURITÉ : vérifier le montant payé avant activation ─────────────
+  // Un checkout créé pour un montant inférieur au prix du premium ne doit
+  // JAMAIS activer l'abonnement (sinon premium à prix réduit).
+  const paidAmount = Number(amount) || 0;
+  if (paidAmount > 0 && paidAmount < leekpay.PREMIUM_AMOUNT) {
+    logger.error('[LeekPay] Montant insuffisant — activation premium REFUSÉE', {
+      checkoutId, userId, paidAmount, required: leekpay.PREMIUM_AMOUNT,
+    });
+    if (checkoutId) {
+      await savePayment(checkoutId, {
+        status: 'paid_insufficient_amount',
+        premiumActivated: false,
+        errorMessage: `Montant payé ${paidAmount} < requis ${leekpay.PREMIUM_AMOUNT}`,
+      });
+    }
+    return;
+  }
+
   // Anti-concurrent
   if (checkoutId && processingPayments.has(checkoutId)) {
     logger.info('[LeekPay] Traitement concurrent — ignoré', { checkoutId });
@@ -512,7 +533,9 @@ async function getPaymentStatus(req, res) {
     return res.status(400).json({ success: false, error: 'transactionId requis.', code: 'MISSING_ID' });
   }
 
-  const cleanId = transactionId.trim();
+  const cleanId   = transactionId.trim();
+  const requester = req.user?.uid || null;
+  const isAdmin   = requester && (process.env.ADMIN_UIDS || '').split(',').map(s => s.trim()).includes(requester);
 
   // 1. Chercher dans Firestore
   try {
@@ -520,6 +543,15 @@ async function getPaymentStatus(req, res) {
     const snap = await db.collection('leekpay_payments').doc(cleanId).get();
     if (snap.exists) {
       const d = snap.data();
+
+      // ── SÉCURITÉ : seul le propriétaire du paiement (ou un admin) peut le consulter
+      if (requester && d.userId && d.userId !== requester && !isAdmin) {
+        logger.warn('[LeekPay] Consultation statut refusée (non-propriétaire)', {
+          requester, checkoutId: cleanId,
+        });
+        return res.status(403).json({ success: false, error: 'Accès refusé.', code: 'FORBIDDEN' });
+      }
+
       return res.status(200).json({
         success         : true,
         source          : 'firestore',
@@ -572,10 +604,16 @@ async function getPaymentStatus(req, res) {
    GET /api/payment/user-status?userId=xxx
 ══════════════════════════════════════════════════════════════════ */
 async function getUserPremiumStatus(req, res) {
-  const userId = (req.query?.userId || req.body?.userId || '').trim();
-  if (!userId) {
-    return res.status(400).json({ success: false, error: 'userId requis.', code: 'MISSING_USER_ID' });
+  // ── SÉCURITÉ : un utilisateur authentifié ne consulte que SON statut.
+  // Sans token → 401. Un userId différent du sien → réservé aux ADMIN_UIDS.
+  const requester = req.user?.uid || null;
+  if (!requester) {
+    return res.status(401).json({ success: false, error: 'Authentification requise.', code: 'NO_TOKEN' });
   }
+
+  const requestedId = (req.query?.userId || req.body?.userId || '').trim();
+  const isAdmin     = (process.env.ADMIN_UIDS || '').split(',').map(s => s.trim()).includes(requester);
+  const userId      = (requestedId && isAdmin) ? requestedId : requester;
 
   try {
     const db   = require('../config/firebase');
@@ -615,7 +653,14 @@ async function getUserPremiumStatus(req, res) {
 ══════════════════════════════════════════════════════════════════ */
 async function pollPayment(req, res) {
   const { checkoutId } = req.params;
-  const { userId }     = req.body || {};
+
+  // ── SÉCURITÉ : userId TOUJOURS issu du token, jamais du body.
+  // (sinon quiconque pourrait activer le premium sur un compte arbitraire)
+  const requester = req.user?.uid || null;
+  if (!requester) {
+    return res.status(401).json({ success: false, error: 'Authentification requise.', code: 'NO_TOKEN' });
+  }
+  const userId = requester;
 
   if (!checkoutId) {
     return res.status(400).json({ success: false, error: 'checkoutId requis.' });
@@ -630,6 +675,16 @@ async function pollPayment(req, res) {
     const isPaid     = statusData.isPaid || statusData.status === 'paid';
 
     if (isPaid && userId) {
+      // Vérifier que ce checkout appartient bien à l'utilisateur qui poll
+      try {
+        const db   = require('../config/firebase');
+        const snap = await db.collection('leekpay_payments').doc(checkoutId).get();
+        if (snap.exists && snap.data()?.userId && snap.data().userId !== userId) {
+          logger.warn('[LeekPay] Poll refusé — checkout appartenant à un autre utilisateur', { checkoutId, requester: userId });
+          return res.status(403).json({ success: false, error: 'Accès refusé.', code: 'FORBIDDEN' });
+        }
+      } catch (_) {}
+
       const alreadyDone = await isAlreadyProcessed(checkoutId);
       if (!alreadyDone) {
         await handleSuccessfulPayment({

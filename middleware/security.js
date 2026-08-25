@@ -135,6 +135,24 @@ const leekPayLimiter = rateLimit({
   message        : { error: 'Trop de tentatives de paiement. Réessayez dans 1 minute.', code: 'PAYMENT_RATE_LIMIT' },
 });
 
+/** Envoi de messages : 60 / 15 min par IP (protège le crédit SMS Infobip) */
+const messageSendLimiter = rateLimit({
+  windowMs       : 15 * 60 * 1000,
+  max            : 60,
+  standardHeaders: true,
+  legacyHeaders  : false,
+  message        : { error: 'Trop de messages envoyés. Réessayez dans 15 minutes.', code: 'MESSAGE_RATE_LIMIT' },
+});
+
+/** Uploads audio/transcription : 20 / 15 min par IP (protège disque/bande passante) */
+const uploadLimiter = rateLimit({
+  windowMs       : 15 * 60 * 1000,
+  max            : 20,
+  standardHeaders: true,
+  legacyHeaders  : false,
+  message        : { error: 'Trop d\'uploads. Réessayez dans 15 minutes.', code: 'UPLOAD_RATE_LIMIT' },
+});
+
 // ── 5. Slow-down (délai progressif avant blocage) ─────────────
 const globalSlowDown = slowDown({
   windowMs         : 15 * 60 * 1000,
@@ -226,6 +244,8 @@ module.exports = {
   authLimiter,
   paymentConfirmLimiter,
   leekPayLimiter,
+  messageSendLimiter,
+  uploadLimiter,
   inputSanitizer,
   requireJson,
   getQueryParam,

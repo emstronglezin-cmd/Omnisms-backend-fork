@@ -206,18 +206,8 @@ router.post('/transcribe/:id', auth, async (req, res) => {
     }
 
     // Chercher le fichier par ID dans uploads/audio si Firestore indisponible
-    if (!audioData) {
-      const files = fs.readdirSync(DIRS.audio);
-      const match = files.find(f => f.startsWith(id));
-      if (match) {
-        audioData = {
-          id,
-          filename: match,
-          uploaderId: uid,
-        };
-      }
-    }
-
+    // SÉCURITÉ : sans doc Firestore on ne peut PAS établir la propriété —
+    // on refuse (fail-closed) au lieu d'attribuer uploaderId au requérant.
     if (!audioData) {
       return res.status(404).json({ error: 'Message vocal non trouvé.', code: 'NOT_FOUND' });
     }
@@ -272,7 +262,7 @@ router.post('/transcribe/:id', auth, async (req, res) => {
       messageId : id,
       userId    : uid,
       language  : language.replace(/[^a-zA-Z]/g, '').slice(0, 5),
-      model     : model || process.env.WHISPER_MODEL || 'small',
+      model     : (model || process.env.WHISPER_MODEL || 'small').toString().replace(/[^a-zA-Z0-9.\-_]/g, '').slice(0, 40) || 'small',
       collection: 'audio_messages',   // collection Firestore à mettre à jour
     });
 
@@ -366,9 +356,13 @@ router.get('/:id', auth, async (req, res) => {
 /* ─────────────────────────────────────────────────────────────
    GET /api/audio/stream/:filename
    Streaming audio sécurisé avec Range headers
+   SÉCURITÉ : accès réservé à l'uploader OU au destinataire du
+   message lié (sinon n'importe quel utilisateur authentifié peut
+   écouter les vocaux d'autrui en devinant le nom de fichier).
    ─────────────────────────────────────────────────────────── */
-router.get('/stream/:filename', auth, (req, res) => {
+router.get('/stream/:filename', auth, async (req, res) => {
   const { filename } = req.params;
+  const uid          = req.user.uid;
 
   // Sécurité : éviter path traversal
   const safeName = path.basename(filename);
@@ -376,6 +370,62 @@ router.get('/stream/:filename', auth, (req, res) => {
 
   if (!fs.existsSync(filePath)) {
     return res.status(404).json({ error: 'Fichier audio introuvable.', code: 'NOT_FOUND' });
+  }
+
+  // ── Vérification de propriété via audio_messages / messages ──
+  const db = getDb();
+  if (db) {
+    try {
+      let hasAccess = false;
+      let audioDoc  = null;
+
+      // Le filename servi correspond au champ `filename` du doc audio_messages
+      // (les URLs publiques sont de la forme /uploads/audio/<filename>).
+      const candidates = [`/uploads/audio/${safeName}`, `uploads/audio/${safeName}`, safeName];
+      for (const candidate of candidates) {
+        const snap = await db.collection('audio_messages')
+          .where('filename', '==', candidate)
+          .limit(1)
+          .get();
+        if (!snap.empty) { audioDoc = snap.docs[0].data(); break; }
+      }
+
+      if (audioDoc) {
+        // 1. L'utilisateur est l'uploader
+        if (audioDoc.uploaderId === uid) {
+          hasAccess = true;
+        } else {
+          // 2. L'utilisateur est destinataire d'un message lié à cet audio
+          const urlVariants = [audioDoc.url, `/uploads/audio/${safeName}`, audioDoc.audioDataUri]
+            .filter(Boolean);
+          for (const urlVariant of urlVariants) {
+            const msgSnap = await db.collection('messages')
+              .where('audioUrl', '==', urlVariant)
+              .where('receiverId', '==', uid)
+              .limit(1)
+              .get();
+            if (!msgSnap.empty) { hasAccess = true; break; }
+          }
+        }
+      } else {
+        // Doc audio_messages introuvable : fallback sur le message lié par URL
+        const msgSnap = await db.collection('messages')
+          .where('audioUrl', 'in', [`/uploads/audio/${safeName}`, `uploads/audio/${safeName}`])
+          .limit(5)
+          .get();
+        hasAccess = msgSnap.docs.some(d => {
+          const m = d.data();
+          return m.senderId === uid || m.receiverId === uid;
+        });
+      }
+
+      if (!hasAccess) {
+        logger.warn('[Audio] stream refusé — accès non autorisé', { filename: safeName, uid });
+        return res.status(403).json({ error: 'Accès refusé.', code: 'FORBIDDEN' });
+      }
+    } catch (err) {
+      logger.warn('[Audio] stream ownership check error (fail-open)', { error: err.message });
+    }
   }
 
   const stat = fs.statSync(filePath);
